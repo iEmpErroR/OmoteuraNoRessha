@@ -5,6 +5,10 @@ using UnityEngine;
 
 public class InteractableItem : MonoBehaviour
 {
+    // ID
+    public static int nextID = 1; // 静态变量用于分配唯一ID
+    private int ID; // 当前物体的ID
+
     // 可交互状态
     private bool isInteractable;
     public bool IsInteractable
@@ -38,9 +42,19 @@ public class InteractableItem : MonoBehaviour
     // 获取 Collider 组件
     private Collider itemCollider;
 
+    private void Awake()
+    {
+        // 分配ID
+        this.ID = InteractableItem.nextID++;
+    }
+
     // Start is called before the first frame update
     void Start()
     {
+        // 上传ID
+        UploadID();
+
+        // 状态初始化
         isInteractable = false;
         hasBeenInteracted = false;
         isMouseHovering = false;
@@ -103,6 +117,28 @@ public class InteractableItem : MonoBehaviour
     #endregion 
 
     #region 私有方法
+
+    // 上传ID
+    private void UploadID()
+    {
+        // 创建材质属性块并设置ID
+        MaterialPropertyBlock mpb = new MaterialPropertyBlock();
+        mpb.SetFloat("_ObjectID", ID);
+
+        // 获取所有子渲染器并上传属性块
+        Renderer[] allRenderers = GetComponentsInChildren<Renderer>();
+        foreach (Renderer renderer in allRenderers)
+        {
+            renderer.SetPropertyBlock(mpb);
+
+            // 调试输出
+            MaterialPropertyBlock debugMPB = new MaterialPropertyBlock();
+            renderer.GetPropertyBlock(debugMPB);
+            float debugID = debugMPB.GetFloat("_ObjectID");
+            Debug.Log($"[{renderer.gameObject.name}] uploaded ID: {ID}");
+            Debug.Log($"设置ID: {ID}, 读取ID: {debugID}");
+        }
+    }
 
     // 标记为已交互
     private void SetInteracted()
