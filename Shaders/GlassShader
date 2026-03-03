@@ -1,0 +1,193 @@
+Shader "Custom/GlassShader"
+{
+	Properties
+	{
+		[Header(Base Properties)]
+		_ColorTint("Color Tint", Color) = (1,1,1,1)
+		_BaseMap("Base Color", 2D) = "White" {}
+		_NormalMap("Normal Map", 2D) = "bump" {}
+		_Bump("Normal Scale", Float) = 1.0
+		_RoughnessMap("Roughness Map", 2D) = "white" {}
+		_Roughness("Roughness", Range(0,1)) = 0.5
+
+		[Header(Advanced Properties)]
+		_Eta("Index of Refraction", Range(0, 2)) = 0.667
+		_Distortion("Distortion", Range(0, 1)) = 1.0
+	}
+	SubShader
+	{
+		Tags
+		{
+			"RenderType"="Transparent"
+			"Queue"="Transparent"
+			"RenderPipeline"="UniversalPipeline"
+			"UniversalMaterialType"="Lit"
+			"IgnoreProjector"="True"
+		}
+
+		// Main Pass
+		Pass
+		{
+			Tags
+			{
+				"LightMode"="UniversalForward"
+			}
+
+			Blend One Zero
+			ZWrite Off
+			ZTest LEqual
+			Cull Off
+
+			HLSLPROGRAM
+
+			#pragma target 3.0
+
+			#pragma vertex vert
+			#pragma fragment frag
+
+			#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+			#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
+			#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareOpaqueTexture.hlsl"
+			#include "Assets/Art/Shaders/CustomPBS.hlsl"
+
+			#pragma shader_feature_local _RECEIVE_SHADOWS
+
+			// 结构体定义
+			struct Attributes
+			{
+				float4 positionOS : POSITION;
+				float3 normalOS : NORMAL;
+				float4 tangentOS : TANGENT;
+				float2 texcoord : TEXCOORD0;
+			};
+
+			struct Varyings
+			{
+				float4 positionCS : SV_POSITION;
+				float4 uv : TEXCOORD0;
+				float3 positionWS : TEXCOORD1;
+				float3 normalWS : TEXCOORD2;
+				float4 tangentWS : TEXCOORD3;
+			};
+
+			// 纹理和采样器定义
+			TEXTURE2D(_BaseMap);
+			SAMPLER(sampler_BaseMap);
+			TEXTURE2D(_NormalMap);
+			SAMPLER(sampler_NormalMap);
+			TEXTURE2D(_RoughnessMap);
+			SAMPLER(sampler_RoughnessMap);
+			TEXTURE2D_X(_OpaqueTexture);
+			SAMPLER(sampler_linear_clamp_OpaqueTexture);
+
+			CBUFFER_START(UnityPerMaterial)
+				float4 _BaseMap_ST;
+				half4 _ColorTint;
+				half _Bump;
+				half _Roughness;
+				float _Eta;
+				half _Distortion;
+			CBUFFER_END
+
+			Varyings vert(Attributes input)
+			{
+				Varyings output;
+
+				// 顶点空间变换
+				VertexPositionInputs vertexInput = GetVertexPositionInputs(input.positionOS.xyz);
+				output.positionCS = vertexInput.positionCS;
+				output.positionWS = vertexInput.positionWS;
+				output.uv.zw = vertexInput.positionNDC.xy;
+				
+				// 法线空间变换
+				VertexNormalInputs normalInput = GetVertexNormalInputs(input.normalOS, input.tangentOS);
+				output.normalWS = normalInput.normalWS;
+				output.tangentWS = float4(normalInput.tangentWS, input.tangentOS.w * GetOddNegativeScale());
+
+				// uv坐标偏移
+				output.uv.xy = TRANSFORM_TEX(input.texcoord, _BaseMap);
+
+				return output;
+			}
+
+			half4 frag(Varyings input) : SV_Target
+			{
+				// 基础颜色和透明度
+				half4 baseColor = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, input.uv.xy);
+				baseColor.rgb *= _ColorTint.rgb;
+
+				// 粗糙度
+				half roughness = SAMPLE_TEXTURE2D(_RoughnessMap, sampler_RoughnessMap, input.uv.xy).a;
+				half roughness_weight = 0.0;
+				if (_Roughness >= 0.5)
+				{
+					roughness_weight = (_Roughness - 0.5) * 2.0;
+					roughness = lerp(roughness, 1.0, roughness_weight);
+				}
+				else
+				{
+					roughness_weight = _Roughness * 2.0;
+					roughness = lerp(roughness, 0.0, roughness_weight);
+				}
+
+				// 法线
+				half3 normalTS = UnpackNormalScale(SAMPLE_TEXTURE2D(_NormalMap, sampler_NormalMap, input.uv.xy), _Bump);
+				half3x3 tangentToWorld = half3x3(input.tangentWS.xyz, normalize(cross(input.normalWS, input.tangentWS.xyz)) * input.tangentWS.w, input.normalWS);
+                half3 normalWS = SafeNormalize(TransformTangentToWorld(normalTS, tangentToWorld));
+
+				// ------------------------------------------ 表面颜色 ---------------------------------------------------- // 
+
+				// 基础数据
+				Light mainLight = GetMainLight();
+				half3 lightColor = mainLight.color * mainLight.shadowAttenuation * mainLight.distanceAttenuation; // 光照颜色
+				half3 lightDirWS = mainLight.direction; // 获取主光源光照方向
+				half3 viewDirWS = GetWorldSpaceNormalizeViewDir(input.positionWS); // 获取视角方向
+				half halfDir = normalize(viewDirWS + lightDirWS); // 计算半程向量
+
+				half NdotV = clamp(abs(dot(normalWS, viewDirWS)), 0, 1);
+				half NdotL = clamp(abs(dot(normalWS, lightDirWS)), 0, 1);
+				half NdotH = clamp(abs(dot(normalWS, halfDir)), 0, 1);
+                half VdotH = clamp(abs(dot(viewDirWS, halfDir)), 0, 1);
+                half LdotH = clamp(abs(dot(lightDirWS, halfDir)), 0, 1);
+
+				// 直接光照
+				half3 F0 = half3(0.04, 0.04, 0.04);
+				half3 directDiffuse = DisneyDiffuseTerm(baseColor.rgb, 0.0, roughness, NdotV, NdotL, LdotH); // 漫反射
+				half3 directSpecular = SpecularTerm(roughness, NdotV, NdotL, NdotH, VdotH, F0);
+				half3 directLighting = (directDiffuse + directSpecular) * PI * NdotL * lightColor;
+
+				// ------------------------------------------ 折射和反射 ---------------------------------------------------- // 
+
+				// 折射
+				float2 screenPos = input.uv.zw / input.positionCS.w;
+				float3 normalVS = normalize(TransformWorldToViewNormal(normalWS));
+				float3 viewDirVS = normalize(mul(GetWorldToViewMatrix(), float4(viewDirWS, 0)).xyz);
+				half3 refractedDirVS = normalize(refract(-viewDirVS, normalVS, _Eta));
+				float2 offset = refractedDirVS.xy * _ScreenParams.zw * _Distortion;
+				screenPos.xy += offset;
+				half3 refractedColor = SAMPLE_TEXTURE2D_X(_OpaqueTexture, sampler_linear_clamp_OpaqueTexture, screenPos).rgb;
+
+
+				// 反射
+				float3 reflectedDirWS = normalize(reflect(-viewDirWS, normalWS));
+				half perceptualRoughness = roughness * (1.7 - 0.7 * roughness);
+                half mip = PerceptualRoughnessToMipmapLevel(perceptualRoughness);
+                half4 encodedIrradiance = SAMPLE_TEXTURECUBE_LOD(unity_SpecCube0, samplerunity_SpecCube0, reflectedDirWS, mip);
+                half3 reflectedColor = DecodeHDREnvironment(encodedIrradiance, unity_SpecCube0_HDR);
+
+				// 菲涅尔混合
+				half fresnelFactor = 0.04 + (1.0 - 0.04) * pow(1.0 - NdotV, 5.0);
+				half3 reColor = lerp(refractedColor, reflectedColor, fresnelFactor);
+
+				// ------------------------------------------ 最终组合 ---------------------------------------------------- //
+
+				half3 finalColor = lerp(reColor, directLighting, baseColor.a);
+
+				return half4 (finalColor, 1);
+			}
+
+			ENDHLSL
+		}
+	}
+	FallBack "Universal Render Pipeline/Lit"
+}
