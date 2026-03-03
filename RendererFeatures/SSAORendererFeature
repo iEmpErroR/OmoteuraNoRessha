@@ -1,0 +1,320 @@
+using System;
+using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.Rendering.Universal;
+
+public class SSAORendererFeature : ScriptableRendererFeature, IDisposable
+{
+    public Shader SSAOShader; // 屏幕空间环境光遮蔽着色器
+    public Shader bilateralFilterShader; // 双边滤波着色器
+
+    public enum SampleCount // 采样枚举精度
+    {
+        Sample16 = 16,
+        Sample32 = 32,
+        Sample64 = 64
+    }
+
+    [System.Serializable] // 配置
+    public class Settings
+    {
+        [Range(0.0f, 1.0f)] public float depthCutThreshold = 0.8f;
+        [Range(0.01f, 5.0f)] public float radius = 1.0f;
+        [Range(0.0f, 0.1f)] public float depthBias = 0.025f;
+        [Range(0.0f, 3.0f)] public float aoStrength = 1.0f;
+        [Range(0.1f, 5.0f)] public float aoPower = 1.0f;
+        public SampleCount sampleCount = SampleCount.Sample64;
+        public bool downSample = true;
+        [Range(0.01f, 5.0f)] public float blurRadius = 1.0f;
+        [Range(1, 8)] public int blurIterations = 1;
+        [Range(0.0f, 1.0f)] public float aoKouka = 1.0f; // AO叠加强度调节
+        public bool debugSSAO = false; // 调试开关
+    }
+
+    public Settings settings = new(); // 实例化配置
+
+    // SSAO渲染通道
+    class SSAORenderPass : ScriptableRenderPass
+    {
+        private readonly Material SSAOMaterial;            // SSAO材质
+        private readonly Material bilateralFilterMaterial; // 双边滤波材质
+        private RTHandle SSAOTexture;                      // SSAO渲染纹理
+        private RTHandle bilateralFilterTexture_1;         // 双边滤波渲染纹理
+        private RTHandle bilateralFilterTexture_2;         // 双边滤波渲染纹理（乒乓）
+        private RTHandle sceneColorTexture;                // 当前颜色纹理
+
+        private readonly float depthCutThreshold; // 深度裁剪阈值
+        private readonly float radius;            // 采样半径
+        private readonly float depthBias;         // 深度偏移
+        private readonly float aoStrength;        // 环境光遮蔽强度
+        private readonly float aoPower;           // 环境光遮蔽幂次
+        private readonly int downSampleFactor;    // 降采样因子
+        private readonly float blurRadius;        // 模糊半径
+        private readonly float blurIterations;    // 模糊迭代次数
+        private readonly int sampleCount;         // 采样数量
+        private int currentSampleCount = 0;       // 当前采样数量
+        private static System.Collections.Generic.List<Vector4> samples = new(); // 采样点数组
+        private static Texture2D noiseTexture;    // 噪声纹理
+        private readonly float aoKouka;          // AO叠加强度调节
+        private readonly bool debugSSAO;         // 调试开关
+
+        private readonly int depthCutThresholdID = Shader.PropertyToID("_DepthCutThreshold");
+        private readonly int radiusID = Shader.PropertyToID("_Radius");
+        private readonly int depthBiasID = Shader.PropertyToID("_DepthBias");
+        private readonly int aoStrengthID = Shader.PropertyToID("_AOStrengh");
+        private readonly int aoPowerID = Shader.PropertyToID("_AOPower");
+        private readonly int blurRadiusID = Shader.PropertyToID("_BlurRadius");
+        private readonly int sampleCountID = Shader.PropertyToID("_SampleCount");
+        private readonly int noiseTextureID = Shader.PropertyToID("_NoiseTexture");
+        private readonly int samplesID = Shader.PropertyToID("_Samples");
+        private readonly int aoKoukaID = Shader.PropertyToID("_AOKouka");
+        private readonly int debugSSAO_ID = Shader.PropertyToID("_DebugSSAO");
+        private readonly int bilateralFilterTexture_1ID = Shader.PropertyToID("_BilateralFilterTexture_1");
+        private readonly int bilateralFilterTexture_2ID = Shader.PropertyToID("_BilateralFilterTexture_2");
+        private readonly int sceneColorTextureID = Shader.PropertyToID("_SceneColorTexture");
+
+        private readonly MaterialPropertyBlock mpb; // 材质属性块
+
+        // 构造函数
+        public SSAORenderPass(Material ssaoM, Material bfM, Settings settings) 
+        {
+            renderPassEvent = RenderPassEvent.AfterRenderingOpaques + 9; // 初始化渲染时机
+            SSAOMaterial = ssaoM;
+            bilateralFilterMaterial = bfM;
+
+            depthCutThreshold = settings.depthCutThreshold;
+            radius = settings.radius;
+            depthBias = settings.depthBias;
+            aoStrength = settings.aoStrength;
+            aoPower = settings.aoPower;
+            downSampleFactor = settings.downSample == true ? 2 : 1;
+            blurRadius = settings.blurRadius;
+            blurIterations = settings.blurIterations;
+            sampleCount = (int)settings.sampleCount; currentSampleCount = sampleCount;
+            GenerateSamples(sampleCount);
+            GenerateNoiseTexture();
+            aoKouka = settings.aoKouka;
+            debugSSAO = settings.debugSSAO;
+
+            mpb = new MaterialPropertyBlock();
+        }
+
+        // 执行前的配置
+        public override void Configure(CommandBuffer cmd, RenderTextureDescriptor cameraTextureDescriptor)
+        {
+            var rtd = new RenderTextureDescriptor(cameraTextureDescriptor.width, cameraTextureDescriptor.height)
+            {
+                colorFormat = RenderTextureFormat.R8,
+                depthBufferBits = 0,
+                msaaSamples = 1
+            };
+
+            RenderingUtils.ReAllocateIfNeeded(ref SSAOTexture, rtd, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_SSAOTexture");
+
+            rtd.colorFormat = RenderTextureFormat.ARGB32;
+            RenderingUtils.ReAllocateIfNeeded(ref sceneColorTexture, rtd, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_SceneColorTexture");
+
+            rtd.width = cameraTextureDescriptor.width / downSampleFactor;
+            rtd.height = cameraTextureDescriptor.height / downSampleFactor;
+            rtd.colorFormat = RenderTextureFormat.R8;
+            RenderingUtils.ReAllocateIfNeeded(ref bilateralFilterTexture_1, rtd, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_bilateralFilterTexture_1");
+            RenderingUtils.ReAllocateIfNeeded(ref bilateralFilterTexture_2, rtd, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_bilateralFilterTexture_2");
+
+            ConfigureTarget(SSAOTexture);
+            ConfigureClear(ClearFlag.Color, Color.white);
+        }
+
+        // 执行渲染
+        public override void Execute(ScriptableRenderContext context, ref RenderingData renderingData)
+        {
+            ReGenerateSamplesIfNeeded(currentSampleCount); // 根据采样数量动态生成采样点
+
+            CommandBuffer cmd = CommandBufferPool.Get("SSAORenderPass"); // 获取命令缓冲区
+            cmd.BeginSample("SSAORenderPass"); // 开始采样
+
+            // 上传数据至材质属性块
+            mpb.SetFloat(depthCutThresholdID, depthCutThreshold);
+            mpb.SetFloat(radiusID, radius);
+            mpb.SetFloat(depthBiasID, depthBias);
+            mpb.SetFloat(aoStrengthID, aoStrength);
+            mpb.SetFloat(aoPowerID, aoPower);
+            mpb.SetInt(sampleCountID, sampleCount);
+            mpb.SetTexture(noiseTextureID, noiseTexture);
+            mpb.SetVectorArray(samplesID, samples);
+            mpb.SetFloat(blurRadiusID, blurRadius);
+            mpb.SetTexture(bilateralFilterTexture_1ID, bilateralFilterTexture_1);
+            mpb.SetTexture(bilateralFilterTexture_2ID, bilateralFilterTexture_2);
+            mpb.SetTexture(sceneColorTextureID, sceneColorTexture);
+            mpb.SetFloat(aoKoukaID, aoKouka);
+            mpb.SetInt(debugSSAO_ID, debugSSAO ? 1 : 0);
+
+            // SSAO-绘制全屏三角形
+            cmd.DrawProcedural(Matrix4x4.identity, SSAOMaterial, 0, MeshTopology.Triangles, 3, 1, mpb);
+            Blitter.BlitCameraTexture(cmd, SSAOTexture, bilateralFilterTexture_1);
+
+            // 双边滤波平滑AO(垂直水平双Pass乒乓)
+            for (int i = 0; i < blurIterations; i++) // 模糊迭代
+            {
+                cmd.SetRenderTarget(bilateralFilterTexture_2);
+                cmd.DrawProcedural(Matrix4x4.identity, bilateralFilterMaterial, 0, MeshTopology.Triangles, 3, 1, mpb);
+                cmd.SetRenderTarget(bilateralFilterTexture_1);
+                cmd.DrawProcedural(Matrix4x4.identity, bilateralFilterMaterial, 1, MeshTopology.Triangles, 3, 1, mpb);
+            }       
+
+            // 将结果写回渲染目标
+            Blitter.BlitCameraTexture(cmd, renderingData.cameraData.renderer.cameraColorTargetHandle, sceneColorTexture);
+            cmd.SetRenderTarget(renderingData.cameraData.renderer.cameraColorTargetHandle);
+            cmd.DrawProcedural(Matrix4x4.identity, bilateralFilterMaterial, 2, MeshTopology.Triangles, 3, 1, mpb);
+
+            cmd.EndSample("SSAORenderPass"); // 结束采样
+            context.ExecuteCommandBuffer(cmd); // 提交命令缓冲区
+            CommandBufferPool.Release(cmd); // 释放命令缓冲区
+        }
+
+        // 释放资源
+        public void Dispose()
+        {
+            SSAOTexture?.Release();
+            SSAOTexture = null;
+
+            bilateralFilterTexture_1?.Release();
+            bilateralFilterTexture_1 = null;
+
+            bilateralFilterTexture_2?.Release();
+            bilateralFilterTexture_2 = null;
+
+            sceneColorTexture?.Release();
+            sceneColorTexture = null;
+        }
+
+        ~SSAORenderPass()
+        {
+            Dispose();
+        }
+
+        // 生成采样点
+        private static void GenerateSamples(int sampleCount)
+        {
+            samples.Clear();
+
+            // 使用固定的随机种子，确保每次生成相同的采样点
+            UnityEngine.Random.InitState(12345);
+
+            for (int i = 0; i < sampleCount; i++)
+            {
+                // 生成在单位球内的随机点
+                Vector3 sample = UnityEngine.Random.insideUnitSphere;
+
+                // 确保点在正Z半球（法线方向）
+                if (sample.z < 0)
+                {
+                    sample = -sample; // 翻转整个向量，保持方向性
+                }
+
+                // 重要性采样：让采样点更靠近原点
+                // 使用加速衰减曲线：i/sampleCount的平方
+                float scale = (float)i / sampleCount;
+                scale = Mathf.Lerp(0.1f, 1.0f, scale * scale);
+
+                // 应用缩放
+                sample *= scale;
+
+                // 归一化以确保方向性（可选）
+                if (sample.magnitude > 0.001f)
+                {
+                    sample.Normalize();
+                    sample *= scale; // 重新应用缩放
+                }
+
+                samples.Add(new Vector4(sample.x, sample.y, sample.z, 0f));
+            }
+
+            // 可选：对采样点排序，让相似的采样点在一起
+            // 这可以提高缓存一致性
+            samples.Sort((a, b) => a.z.CompareTo(b.z));
+        }
+
+        // 重分配采样点
+        private void ReGenerateSamplesIfNeeded(int newSampleCount)
+        {
+            if (newSampleCount != currentSampleCount)
+            {
+                currentSampleCount = newSampleCount;
+                GenerateSamples(currentSampleCount);
+            }
+        }
+
+        // 生成噪声纹理
+        private static void GenerateNoiseTexture()
+        {
+            const int width = 16;
+            noiseTexture = new Texture2D(width, width, TextureFormat.RGB24, false);
+
+            for (int y = 0; y < width; y++)
+            {
+                for (int x = 0; x < width; x++)
+                {
+                    // 生成随机旋转向量
+                    Vector3 noise = new Vector3(
+                        UnityEngine.Random.Range(0.0f, 1.0f),
+                        UnityEngine.Random.Range(0.0f, 1.0f),
+                        UnityEngine.Random.Range(0.0f, 1.0f)
+                    );
+
+                    noiseTexture.SetPixel(x, y, new Color(noise.x, noise.y, noise.z, 1));
+                }
+            }
+
+            noiseTexture.Apply();
+            noiseTexture.wrapMode = TextureWrapMode.Repeat;
+            noiseTexture.filterMode = FilterMode.Point;
+        }
+    }
+
+    private Material SSAOMaterial; // SSAO材质
+    private Material bilateralFilterMaterial; // 双边滤波材质
+    SSAORenderPass m_SSAORenderPass; // SSAO渲染通道
+
+    // 创建渲染通道和材质
+    public override void Create()
+    {
+        Dispose(true);
+
+        SSAOMaterial = CoreUtils.CreateEngineMaterial(SSAOShader);
+        bilateralFilterMaterial = CoreUtils.CreateEngineMaterial(bilateralFilterShader);
+        if (SSAOMaterial == null || bilateralFilterMaterial == null)
+        {
+            Debug.LogWarning("Failed to create one or more materials for SSAORenderPass.");
+            return;
+        }
+
+        m_SSAORenderPass = new SSAORenderPass(SSAOMaterial, bilateralFilterMaterial, settings);
+    }
+
+    // 添加渲染通道
+    public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
+    {
+        // 仅在游戏相机和场景视图相机中开启轮廓渲染通道
+        if (renderingData.cameraData.cameraType == CameraType.Game ||
+            renderingData.cameraData.cameraType == CameraType.SceneView)
+        {
+            renderer.EnqueuePass(m_SSAORenderPass);
+        }
+    }
+
+    // 释放资源
+    protected override void Dispose(bool disposing)
+    {
+        m_SSAORenderPass?.Dispose();
+        m_SSAORenderPass = null;
+
+        if (disposing)
+        {
+            CoreUtils.Destroy(SSAOMaterial);
+            SSAOMaterial = null;
+
+            CoreUtils.Destroy(bilateralFilterMaterial);
+            bilateralFilterMaterial = null;
+        }
+    }
+}
