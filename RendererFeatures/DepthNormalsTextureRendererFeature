@@ -1,0 +1,113 @@
+using System.Diagnostics.CodeAnalysis;
+using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.Rendering.Universal;
+
+public class DepthNormalsTextureRendererFeature : ScriptableRendererFeature
+{
+    [System.Serializable] // 类序列化，实例化后可在编辑器中显示编辑
+    public class Settings
+    {
+        public LayerMask layerMask = 1;
+        public RenderPassEvent renderPassEvent = RenderPassEvent.AfterRenderingOpaques;
+    }
+
+    public Settings settings = new Settings(); // 实例化Settings类
+
+    class DepthNormalsTextureRenderPass : ScriptableRenderPass
+    {
+        private FilteringSettings filteringSettings; // 过滤设置
+        private RTHandle depthTexture; // 深度渲染纹理
+        private RTHandle normalsTexture; // 法线渲染纹理
+
+        // 构造函数
+        public DepthNormalsTextureRenderPass(Settings settings)
+        {
+            filteringSettings = new FilteringSettings(RenderQueueRange.opaque, settings.layerMask, renderingLayerMask: 1);
+            renderPassEvent = settings.renderPassEvent;
+        }
+
+        // 配置渲染目标
+        public override void Configure(CommandBuffer cmd, RenderTextureDescriptor cameraTextureDescriptor)
+        {
+            RenderTextureDescriptor rtd = new RenderTextureDescriptor(cameraTextureDescriptor.width, cameraTextureDescriptor.height)
+            {
+                colorFormat = RenderTextureFormat.Depth,
+                depthBufferBits = 24,
+                msaaSamples = 1
+            };
+
+            RenderingUtils.ReAllocateIfNeeded(ref depthTexture, rtd, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_DepthTexture");
+
+            rtd.colorFormat = RenderTextureFormat.RG16;
+            rtd.depthBufferBits = 0;
+            RenderingUtils.ReAllocateIfNeeded(ref normalsTexture, rtd, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_NormalsTexture");
+
+            ConfigureTarget(normalsTexture, depthTexture);
+            ConfigureClear(ClearFlag.All, Color.clear);
+        }
+
+        // 执行渲染
+        public override void Execute(ScriptableRenderContext context, ref RenderingData renderingData)
+        {
+            CommandBuffer cmd = CommandBufferPool.Get("DepthNormalsTextureRenderPass");
+
+            var drawingSettings = CreateDrawingSettings(new ShaderTagId("NormalsOnly"), 
+                                                        ref renderingData, 
+                                                        renderingData.cameraData.defaultOpaqueSortFlags);
+
+            var rendererListParams = new RendererListParams(renderingData.cullResults, drawingSettings, filteringSettings);
+            var rendererList = context.CreateRendererList(ref rendererListParams);
+            cmd.DrawRendererList(rendererList);
+
+            cmd.SetGlobalTexture("_DepthTexture", depthTexture);
+            cmd.SetGlobalTexture("_NormalsTexture", normalsTexture);
+
+            context.ExecuteCommandBuffer(cmd);
+            CommandBufferPool.Release(cmd);
+        }
+
+        // 释放资源
+        public void Dispose()
+        {
+            depthTexture?.Release();
+            depthTexture = null;
+
+            normalsTexture?.Release();
+            normalsTexture = null;
+        }
+    }
+
+    private DepthNormalsTextureRenderPass m_DepthNormalsTextureRenderPass;
+
+    /// <inheritdoc/>
+    public override void Create()
+    {
+        // 清理旧的资源
+        Dispose(true);
+
+        // 创建渲染通道
+        m_DepthNormalsTextureRenderPass = new DepthNormalsTextureRenderPass(settings);
+    }
+
+    public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
+    {
+        // 仅在游戏相机和场景视图相机中开启轮廓渲染通道
+        if (renderingData.cameraData.cameraType == CameraType.Game ||
+            renderingData.cameraData.cameraType == CameraType.SceneView)
+        {
+            renderer.EnqueuePass(m_DepthNormalsTextureRenderPass);
+        }
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        m_DepthNormalsTextureRenderPass?.Dispose();
+        m_DepthNormalsTextureRenderPass = null;
+
+        if (disposing)
+        {
+
+        }
+    }
+}
