@@ -1,0 +1,134 @@
+Shader "Custom/WaterFlowShader"
+{
+    Properties
+    {
+        _MainTex ("Texture", 2D) = "white" {}
+        _FlowMap ("Flow Map (RG)", 2D) = "white" {}
+        _FlowIntensity ("Flow Intensity", Range(0, 10)) = 1.0
+        _FlowSpeed ("Flow Speed", Float) = 1.0
+        [Toggle(_USE_INTENSITY_FROM_FLOWMAP)] _UseIntensityFromFlowMap ("Use Intensity From Flow Map", Float) = 0
+        [Toggle(_Yaxis_Inverse)] _Yaxis_Inverse ("Y-axis Inverse", Float) = 0
+        [Toggle(_REVERSE)] _Reverse ("Flow Reverse", Float) = 0
+    }
+    SubShader
+    {
+        Tags { "RenderType"="Transparent" 
+               "RenderPipeline" = "UniversalPipeline"
+               "Queue" = "Transparent"
+              }
+        LOD 100
+
+        HLSLINCLUDE
+
+        #pragma shader_feature_local _USE_INTENSITY_FROM_FLOWMAP
+        #pragma shader_feature_local _Yaxis_Inverse
+        #pragma shader_feature_local _REVERSE
+
+        #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+
+        TEXTURE2D(_MainTex);
+        SAMPLER(sampler_MainTex);
+        TEXTURE2D(_FlowMap);
+        SAMPLER(sampler_FlowMap);
+
+        CBUFFER_START(UnityPerMaterial)
+            float4 _MainTex_ST;
+            half _FlowIntensity;
+            half _FlowSpeed;
+        CBUFFER_END
+
+        struct Attributes
+        {
+            float4 positionOS : POSITION;
+            float2 uv : TEXCOORD0;
+        };
+
+        struct Varyings
+        {
+            float4 positionCS : SV_POSITION;
+            float2 uv : TEXCOORD0;
+
+            #ifdef _Yaxis_Inverse
+                float2 uv_flipY : TEXCOORD1;
+            #endif
+        };
+
+        Varyings vert(Attributes input)
+        {
+            Varyings output;
+
+            VertexPositionInputs vertexinput = GetVertexPositionInputs(input.positionOS.xyz);
+            output.positionCS = vertexinput.positionCS;
+            output.uv = input.uv;
+
+            #ifdef _Yaxis_Inverse
+                output.uv_flipY = float2(input.uv.x, 1 - input.uv.y);
+            #endif
+
+            return output;
+        }
+
+        half4 frag(Varyings input) : SV_Target
+        {
+            // 强度
+            half Intensity = _FlowIntensity;
+
+            #ifdef _Yaxis_Inverse
+                // 使用流动贴图的Blue通道作为强度
+                #ifdef _USE_INTENSITY_FROM_FLOWMAP
+                    Intensity = SAMPLE_TEXTURE2D(_FlowMap, sampler_FlowMap, input.uv_flipY).b * _FlowIntensity;
+                #endif
+            
+                // 计算流动偏移
+                half2 flow = (SAMPLE_TEXTURE2D(_FlowMap, sampler_FlowMap, input.uv_flipY).rg * 2.0 - 1.0) * Intensity;
+
+            #else
+                #ifdef _USE_INTENSITY_FROM_FLOWMAP
+                    Intensity = SAMPLE_TEXTURE2D(_FlowMap, sampler_FlowMap, input.uv).b * _FlowIntensity;
+                #endif
+            
+                half2 flow = (SAMPLE_TEXTURE2D(_FlowMap, sampler_FlowMap, input.uv).rg * 2.0 - 1.0) * Intensity;
+            #endif
+
+            // 反转流动方向
+            #ifdef _REVERSE
+                flow *= -1;
+            #endif
+
+            // 计算两个采样阶段
+            float phase0 = frac(_Time.y * _FlowSpeed);
+            float phase1 = frac(_Time.y * _FlowSpeed + 0.5);
+
+            // 采样颜色
+            half2 uv = TRANSFORM_TEX(input.uv, _MainTex);
+            half3 waterColor0 = SAMPLE_TEXTURE2D(_MainTex, sampler_MainTex, uv + flow * phase0).rgb;
+            half3 waterColor1 = SAMPLE_TEXTURE2D(_MainTex, sampler_MainTex, uv + flow * phase1).rgb;
+
+            // 权重和混合
+            half weight = abs((0.5 - phase0) / 0.5);
+            half3 finalColor = lerp(waterColor0, waterColor1, weight);
+
+            return half4(finalColor, 1);
+        }
+
+        ENDHLSL
+
+        Pass
+        {
+            Name "WaterFlow"
+            Tags { "LightMode"="UniversalForward" }
+
+            Cull Off
+            ZWrite Off
+            ZTest LEqual
+            Blend SrcAlpha OneMinusSrcAlpha
+
+            HLSLPROGRAM
+
+            #pragma vertex vert
+            #pragma fragment frag
+
+            ENDHLSL
+        }
+    }
+}
