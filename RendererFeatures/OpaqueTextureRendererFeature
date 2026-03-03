@@ -1,0 +1,166 @@
+using Unity.VisualScripting;
+using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.Rendering.Universal;
+using static OpaqueTextureRendererFeature;
+
+public class OpaqueTextureRendererFeature : ScriptableRendererFeature
+{
+    // 下采样模式
+    public enum DownSampleFactor
+    {
+        None,
+        _2x_Bilinear,
+        _4x_Bilinear
+    }
+
+    [System.Serializable] // 不透明纹理设置(实例化后可在Inspector中可视化编辑)
+    public class OpaqueTextureSettings
+    {
+        public Shader downSampleShader; // 下采样Shader
+        public DownSampleFactor downSample = DownSampleFactor.None; // 下采样模式
+        public RenderPassEvent renderPassEvent = RenderPassEvent.AfterRenderingOpaques; // 渲染时机
+    }
+
+    public OpaqueTextureSettings settings = new OpaqueTextureSettings(); // 设置-实例化
+
+    // 不透明纹理渲染通道
+    class OpaqueTextureRenderPass : ScriptableRenderPass
+    {
+        private readonly Material downSampleMaterial; // 下采样材质
+        private readonly int downSampleFactor; // 下采样因子
+        // private RenderTextureDescriptor rtd; // RT描述符
+        private RTHandle opaqueTexture; // 不透明纹理RTHandle
+
+        public OpaqueTextureRenderPass(Material dsm, OpaqueTextureSettings ots)
+        {
+            // 初始化材质
+            downSampleMaterial = dsm;
+
+            // 初始化下采样因子
+            if (ots.downSample == DownSampleFactor._2x_Bilinear)
+            {
+                downSampleFactor = 2;
+            }
+            else if (ots.downSample == DownSampleFactor._4x_Bilinear)
+            {
+                downSampleFactor = 4;
+            }
+            else
+            {
+                downSampleFactor = 1;
+            }
+
+            // 初始化RT描述符
+            // rtd = new RenderTextureDescriptor(Screen.width, Screen.height, RenderTextureFormat.ARGB32, 0, 0, RenderTextureReadWrite.Default);
+
+            // 初始化渲染时机
+            renderPassEvent = ots.renderPassEvent;
+        }
+
+        // 执行前的配置
+        public override void Configure(CommandBuffer cmd, RenderTextureDescriptor cameraTextureDescriptor)
+        {
+            // 配置RT描述符
+            var rtd = new RenderTextureDescriptor(cameraTextureDescriptor.width / downSampleFactor,
+                                                  cameraTextureDescriptor.height / downSampleFactor,
+                                                  RenderTextureFormat.ARGB32,
+                                                  0)
+            {
+                msaaSamples = 1,
+                useDynamicScale = false,
+                useMipMap = false
+            };
+
+            // 分配RTHandle
+            RenderingUtils.ReAllocateIfNeeded(ref opaqueTexture, rtd, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_OpaqueTexture");
+
+            // 配置渲染目标
+            ConfigureTarget(opaqueTexture);
+            ConfigureClear(ClearFlag.All, Color.clear);
+        }
+
+        // 执行渲染
+        public override void Execute(ScriptableRenderContext context, ref RenderingData renderingData)
+        {
+            if (downSampleMaterial == null)
+            {
+                Debug.LogError("DownSample Material is null in OpaqueTextureRenderPass.");
+                return;
+            }
+
+            // 获取命令缓冲区
+            CommandBuffer cmd = CommandBufferPool.Get("OpaqueTextureRenderPass");
+
+            // 上传下采样因子至材质
+            downSampleMaterial.SetInt("_DownSampleFactor", downSampleFactor);
+
+            // 执行下采样Blit
+            Blitter.BlitCameraTexture(cmd, renderingData.cameraData.renderer.cameraColorTargetHandle, opaqueTexture, downSampleMaterial, 0);
+
+            // 设置全局纹理
+            cmd.SetGlobalTexture("_OpaqueTexture", opaqueTexture);
+
+            // 提交命令缓冲区并释放
+            context.ExecuteCommandBuffer(cmd);
+            CommandBufferPool.Release(cmd);
+        }
+
+        // 执行后清理
+        public void Dispose()
+        {
+            // 释放opaqueTexture
+            opaqueTexture?.Release();
+            opaqueTexture = null;
+        }
+    }
+
+    private Material m_downSampleMaterial; // 下采样材质
+    private OpaqueTextureRenderPass m_OpaqueTextureRenderPass;
+
+    // 创建函数
+    public override void Create()
+    {
+        // 清理旧的资源
+        Dispose(true);
+
+        // 初始化下采样材质
+        m_downSampleMaterial = CoreUtils.CreateEngineMaterial(settings.downSampleShader);
+
+        // 简化材质检查
+        if (m_downSampleMaterial == null)
+        {
+            Debug.LogWarning("Failed to create downSampleMaterial for OpaqueTextureRenderPass.");
+            return;
+        }
+
+        // 创建渲染通道
+        m_OpaqueTextureRenderPass = new OpaqueTextureRenderPass(m_downSampleMaterial, settings);
+    }
+
+    // 在哪些摄像头下启用渲染通道
+    public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
+    {
+        // 仅在游戏相机和场景视图相机中开启轮廓渲染通道
+        if (renderingData.cameraData.cameraType == CameraType.Game ||
+            renderingData.cameraData.cameraType == CameraType.SceneView)
+        {
+            renderer.EnqueuePass(m_OpaqueTextureRenderPass);
+        }
+    }
+
+    // 释放资源
+    protected override void Dispose(bool disposing)
+    {
+        // 释放渲染通道
+        m_OpaqueTextureRenderPass?.Dispose();
+        m_OpaqueTextureRenderPass = null;
+
+        if (disposing)
+        {
+            // 释放downSampleMaterial
+            CoreUtils.Destroy(m_downSampleMaterial);
+            m_downSampleMaterial = null;
+        }
+    }
+}
