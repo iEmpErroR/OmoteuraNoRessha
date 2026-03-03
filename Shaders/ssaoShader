@@ -1,0 +1,178 @@
+Shader "Custom/SSAO Shader"
+{
+	Properties
+	{
+		_DepthCutThreshold ("Depth Cut Threshold", Range(0, 1)) = 0.9
+		_Radius ("Sample Radius", Range(0.01, 5.0)) = 1.0
+		_DepthBias ("Depth Bias", Range(0.0, 0.1)) = 0.025
+		_AOStrengh ("AO Strength", Range(0.0, 5.0)) = 1.0
+		_AOPower ("AO Power", Range(0.1, 5.0)) = 1.0
+		_SampleCount ("Sample Count", Range(1, 64)) = 64
+		_NoiseTexture ("Noise Texture", 2D) = "white" {}
+	}
+
+	SubShader
+	{
+		Tags
+		{
+			"RenderPipeline"="UniversalPipeline"
+		}
+
+		Pass
+		{
+			Name "SSAO_Pass"
+
+			Tags
+			{
+				"LightMode"="UniversalForward"
+			}
+
+			Cull Back
+			ZWrite Off
+			ZTest Always
+			Blend SrcAlpha OneMinusSrcAlpha
+
+			HLSLPROGRAM
+
+			#pragma vertex vert
+			#pragma fragment frag
+
+			#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+
+			struct Attributes
+			{
+				uint vertexID : SV_VertexID;
+			};
+
+			struct Varyings
+			{
+				float4 positionCS : SV_POSITION;
+				float2 uv : TEXCOORD0;
+				float3 viewRay : TEXCOORD1; // 视图空间射线方向
+			};
+
+			// 在此处定义所需的纹理和常量缓冲区
+			TEXTURE2D_X_FLOAT(_DepthTexture);
+			SAMPLER(sampler_linear_clamp_DepthTexture);
+			TEXTURE2D_X(_NormalsTexture);
+			SAMPLER(sampler_linear_clamp_NormalsTexture);
+			TEXTURE2D(_NoiseTexture);
+			SAMPLER(sampler_linear_clamp_NoiseTexture);
+
+			#define EPSILON 1e-6
+			#define MAXSAMPLES 64
+
+			CBUFFER_START(UnityPerMaterial)
+				half _DepthCutThreshold;
+				float _Radius;
+				float4 _Samples[MAXSAMPLES];
+				uint _SampleCount;
+				float _DepthBias;
+				half _AOStrengh;
+				half _AOPower;
+			CBUFFER_END	
+
+			float GetLinearEyeDepth(float2 uv, float4 zBufferParams)
+			{
+				float rawDepth = SAMPLE_TEXTURE2D_X(_DepthTexture, sampler_linear_clamp_DepthTexture, uv).r;
+				return LinearEyeDepth(rawDepth, zBufferParams);
+			}
+
+			float GetLinear01Depth(float2 uv, float4 zBufferParams)
+			{
+				float rawDepth = SAMPLE_TEXTURE2D_X(_DepthTexture, sampler_linear_clamp_DepthTexture, uv).r;
+				return Linear01Depth(rawDepth, zBufferParams);
+			}
+
+			half3x3 BuildTBN(half3 N, half3 rvec)
+			{  
+				// Gram-Schmidt
+				half3 T = normalize(rvec - dot(rvec, N) * N);
+				half3 B = cross(N, T);
+    
+				return half3x3(T, B, N);
+			}
+
+			Varyings vert(Attributes input)
+			{
+				Varyings output;
+
+				// 基本变换
+				output.positionCS = GetFullScreenTriangleVertexPosition(input.vertexID);
+				output.uv = GetFullScreenTriangleTexCoord(input.vertexID);
+
+				// 计算视图空间射线方向
+				float4 clipPos = float4(output.uv * 2.0 - 1.0, 1.0, 1.0);
+				// 处理平台差异
+				#if UNITY_UV_STARTS_AT_TOP
+					clipPos.y = -clipPos.y;
+				#endif
+				float4 viewRay = mul(UNITY_MATRIX_I_P, clipPos);
+				output.viewRay = viewRay.xyz / viewRay.w;
+				output.viewRay /= -(output.viewRay.z + EPSILON); // 归一化到z=-1平面
+
+				return output;
+			}
+
+			half4 frag(Varyings input) : SV_Target
+			{
+				// 重构视角空间坐标
+				float linearEyeDepth = GetLinearEyeDepth(input.uv, _ZBufferParams);
+				float linear01Depth = linearEyeDepth * _ProjectionParams.w;
+				if (linear01Depth >= _DepthCutThreshold || linearEyeDepth < 0.1)
+				{
+					return half4 (1, 1, 1, 1);
+				}
+				float3 positionVS = input.viewRay * linearEyeDepth;
+
+				// 获取法线
+				half3 normalVS = UnpackNormalOctQuadEncode(SAMPLE_TEXTURE2D_X(_NormalsTexture, sampler_linear_clamp_NormalsTexture, input.uv).rg);
+
+				// Gram-Schmidt正交基构建
+				float2 noiseScale = _ScreenParams.xy / 16.0;
+				float2 noiseUV = input.uv * noiseScale;
+				float3 randomVec = SAMPLE_TEXTURE2D(_NoiseTexture, sampler_linear_clamp_NoiseTexture, noiseUV).rgb * 2.0 - 1.0;
+				half3x3 TBN = BuildTBN(normalVS, randomVec);
+
+				// SSAO核心算法
+				float occlusion = 0.0; // 遮蔽值累积
+				float sampleRadius = _Radius * (1.0 - saturate(linear01Depth * 0.5)); // 采样半径
+				uint sampleCount = min((uint)_SampleCount, MAXSAMPLES); // 采样数量限制
+
+				// 强行展开循环
+				[unroll]
+				for (int i = 0; i < sampleCount; i++) // 采样循环
+				{
+					// 计算采样点坐标
+					float3 sampleOffset = _Samples[i].xyz;
+					float3 samplePosVS = positionVS + mul(TBN, sampleOffset) * sampleRadius;
+					float4 offsetClipPos = mul(GetViewToHClipMatrix(), float4(samplePosVS, 1.0));
+					offsetClipPos /= offsetClipPos.w;
+
+					// 计算采样点屏幕空间UV坐标 To 采样深度
+					float2 sampleUV = offsetClipPos.xy * 0.5 + 0.5;
+					#if UNITY_UV_STARTS_AT_TOP
+						sampleUV.y = 1.0 - sampleUV.y;
+					#endif
+					if (any(sampleUV < 0.0) || any(sampleUV > 1.0))
+						continue;
+					float sampleDepth = -samplePosVS.z;
+					float sceneDepth = GetLinearEyeDepth(sampleUV, _ZBufferParams);
+
+					float weight = 1.0 - length(sampleOffset); // 计算权重
+					half selfCheck = (sampleDepth - _DepthBias) > sceneDepth ? 1.0 : 0.0; // 深度偏移 - 平面错误遮蔽优化
+					half isOccluded = (sampleDepth - sceneDepth) < 0.3 ? 1.0 : 0.0; // 遮蔽检测
+
+					occlusion += isOccluded * selfCheck * weight;
+				}
+
+				occlusion = saturate(1.0 - (occlusion / sampleCount) * _AOStrengh); // 归一化遮蔽值
+				occlusion = pow(occlusion, _AOPower); // 调整遮蔽强度
+				
+				return half4(occlusion, occlusion, occlusion, 1);
+			}
+
+			ENDHLSL
+		}
+	}
+}
